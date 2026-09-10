@@ -4,7 +4,7 @@ import re
 
 _NB_DRONES_LINE = re.compile(r"^nb_drones:\s+(?P<value>\d+)\s*$")
 _START_HUB_LINE = re.compile(
-    r"^(?P<kind>start_hub|end_hub|hub):\s+(?P<name>\w+)\s+(?P<x>\d+)\s+(?P<y>\d+)"
+    r"^(?P<kind>start_hub|end_hub|hub):\s+(?P<name>\w+)\s+(?P<x>-?\d+)\s+(?P<y>-?\d+)"
     r"(?:\s+\[(?P<meta>.*)\])?\s*$"
 )
 
