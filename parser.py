@@ -1,130 +1,224 @@
-from models import Connection, DroneMap, Zone, ZoneType
+"""Parser of the map file format described in the subject.
+
+A map file starts with ``nb_drones: <n>``, then declares zones with
+``start_hub:``, ``end_hub:`` and ``hub:`` lines, and edges with
+``connection:`` lines. Everything after ``#`` is a comment.
+"""
 
 import re
 
-_NB_DRONES_LINE = re.compile(r"^nb_drones:\s+(?P<value>\d+)\s*$")
-_START_HUB_LINE = re.compile(
-    r"^(?P<kind>start_hub|end_hub|hub):\s+(?P<name>\w+)\s+(?P<x>-?\d+)\s+(?P<y>-?\d+)"
-    r"(?:\s+\[(?P<meta>.*)\])?\s*$"
-)
+from models import Connection, DroneMap, Zone, ZoneType
 
-_CONNECTION_LINE = re.compile(
-    r"^connection:\s+(?P<a>[^\s\-]+)-(?P<b>[^\s\-]+)"
-    r"(?:\s+\[(?P<meta>.*)\])?\s*$"
+_NAME = r"[^\s\-\[\]]+"
+_NB_DRONES_LINE = re.compile(r"^nb_drones:\s+(?P<value>\S+)\s*$")
+_HUB_LINE = re.compile(
+    rf"^(?P<kind>start_hub|end_hub|hub):\s+(?P<name>{_NAME})"
+    r"\s+(?P<x>-?[0-9]+)\s+(?P<y>-?[0-9]+)"
+    r"(?:\s+\[(?P<meta>[^\[\]]*)\])?\s*$"
 )
+_CONNECTION_LINE = re.compile(
+    rf"^connection:\s+(?P<a>{_NAME})-(?P<b>{_NAME})"
+    r"(?:\s+\[(?P<meta>[^\[\]]*)\])?\s*$"
+)
+_HUB_KINDS = ("start_hub", "end_hub", "hub")
+_HUB_META_KEYS = frozenset({"zone", "color", "max_drones"})
+_CONNECTION_META_KEYS = frozenset({"max_link_capacity"})
 
 
 class ParserError(Exception):
-    def __init__(self, no_line: int, error: str):
-        super().__init__(f"line {no_line}: {error}")
-        self.no_line = no_line
-        self.error = error
+    """Error raised when a map file is malformed.
+
+    Attributes:
+        line_no: Number of the faulty line (1-based, 0 when unknown).
+        reason: Human readable cause of the error.
+    """
+
+    def __init__(self, line_no: int, reason: str) -> None:
+        super().__init__(f"line {line_no}: {reason}")
+        self.line_no = line_no
+        self.reason = reason
 
 
 class Parser:
+    """Turn the lines of a map file into a DroneMap."""
 
-    def _parse_meta(self, meta_str: str | None, line_no: int) -> dict[str, str]:
-        if meta_str is None:
-            return {}
-        meta: dict[str, str] = {}
-        for token in meta_str.split():
-            parts = token.split("=")
-            if len(parts) != 2:
+    def parse_file(self, path: str) -> DroneMap:
+        """Read and parse a map file.
+
+        Raises:
+            ParserError: If the file cannot be read or is malformed.
+        """
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError as e:
+            raise ParserError(0, f"cannot read {path!r}: {e.strerror}")
+        except UnicodeDecodeError:
+            raise ParserError(0, f"{path!r} is not a UTF-8 text file")
+        return self.parse_lines(lines)
+
+    def parse_lines(self, lines: list[str]) -> DroneMap:
+        """Parse the lines of a map.
+
+        Raises:
+            ParserError: On the first malformed line.
+        """
+        drone_map: DroneMap | None = None
+        line_no = 0
+        for line_no, raw_line in enumerate(lines, start=1):
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            kind = line.split(":", 1)[0]
+            if kind == "nb_drones":
+                if drone_map is not None:
+                    raise ParserError(
+                        line_no, "nb_drones is declared more than once")
+                drone_map = DroneMap(self._parse_nb_drones(line, line_no))
+            elif drone_map is None:
                 raise ParserError(
-                    line_no, f"Invalid metadata token: {token!r}")
-            meta[parts[0]] = parts[1]
-        return meta
+                    line_no, "the first line must be 'nb_drones: <number>'")
+            elif kind == "connection":
+                self._parse_connection(line, line_no, drone_map)
+            elif kind in _HUB_KINDS:
+                self._parse_hub(line, line_no, drone_map)
+            else:
+                raise ParserError(
+                    line_no, f"unknown declaration {line!r} (expected "
+                    "start_hub:, end_hub:, hub: or connection:)")
+
+        if drone_map is None:
+            raise ParserError(line_no, "no nb_drones declaration found")
+        if drone_map.start_zone is None:
+            raise ParserError(line_no, "missing start_hub declaration")
+        if drone_map.end_zone is None:
+            raise ParserError(line_no, "missing end_hub declaration")
+        return drone_map
 
     def _parse_nb_drones(self, line: str, line_no: int) -> int:
+        """Parse the ``nb_drones: <n>`` line."""
         match = _NB_DRONES_LINE.match(line)
         if match is None:
             raise ParserError(
-                line_no, f"Invalid nb_drones declaration: {line!r}")
-        result = int(match.group("value"))
-        if result <= 0:
-            raise ParserError(
-                line_no, f"Invalid number, numbers must be positive integers: {line!r}")
-        return result
+                line_no, f"invalid nb_drones declaration {line!r} "
+                "(expected 'nb_drones: <number>')")
+        return self._positive_int(match.group("value"), "nb_drones", line_no)
 
-    def _parse_hub(self, line: str, line_no: int, drone_map: DroneMap) -> None:
-        match = _START_HUB_LINE.match(line)
+    def _parse_hub(
+        self, line: str, line_no: int, drone_map: DroneMap
+    ) -> None:
+        """Parse a ``start_hub:``, ``end_hub:`` or ``hub:`` line."""
+        match = _HUB_LINE.match(line)
         if match is None:
-            raise ParserError(line_no, f"Invalid hub declaration: {line!r}")
+            raise ParserError(
+                line_no, f"invalid zone declaration {line!r} "
+                "(expected '<kind>: <name> <x> <y> [metadata]')")
         kind = match.group("kind")
-        name = match.group("name")
-        x = match.group("x")
-        y = match.group("y")
-        meta = self._parse_meta(match.group("meta"), line_no)
-        try:
-            zone = Zone(
-                name=name,
-                x=int(x),
-                y=int(y),
-                zone_type=ZoneType(meta.get("zone", "normal")),
-                color=meta.get("color"),
-                max_drones=int(meta.get("max_drones", "1")),
-                is_start=(kind == "start_hub"),
-                is_end=(kind == "end_hub"),
-            )
-            drone_map.add_zone(zone)
-        except Exception as e:
-            raise ParserError(line_no, f" {e}: {line!r}")
+        is_start = kind == "start_hub"
+        is_end = kind == "end_hub"
+        meta = self._parse_meta(match.group("meta"), _HUB_META_KEYS, line_no)
 
-    def _parse_connection(self, line: str, line_no: int, drone_map: DroneMap) -> None:
+        type_name = meta.get("zone", "normal")
+        try:
+            zone_type = ZoneType(type_name)
+        except ValueError:
+            raise ParserError(
+                line_no, f"unknown zone type {type_name!r} (allowed: "
+                + ", ".join(t.value for t in ZoneType) + ")")
+        if zone_type is ZoneType.BLOCKED and (is_start or is_end):
+            raise ParserError(line_no, f"{kind} cannot be a blocked zone")
+
+        max_drones = 1
+        if "max_drones" in meta and not (is_start or is_end):
+            max_drones = self._positive_int(
+                meta["max_drones"], "max_drones", line_no)
+
+        zone = Zone(
+            name=match.group("name"),
+            x=int(match.group("x")),
+            y=int(match.group("y")),
+            zone_type=zone_type,
+            color=meta.get("color"),
+            max_drones=max_drones,
+            is_start=is_start,
+            is_end=is_end,
+        )
+        try:
+            drone_map.add_zone(zone)
+        except ValueError as e:
+            raise ParserError(line_no, str(e))
+
+    def _parse_connection(
+        self, line: str, line_no: int, drone_map: DroneMap
+    ) -> None:
+        """Parse a ``connection: <a>-<b> [metadata]`` line."""
         match = _CONNECTION_LINE.match(line)
         if match is None:
             raise ParserError(
-                line_no, f"Invalid connection declaration: {line!r}")
+                line_no, f"invalid connection declaration {line!r} "
+                "(expected 'connection: <zone1>-<zone2> [metadata]')")
         zone_a = match.group("a")
         zone_b = match.group("b")
-        meta = self._parse_meta(match.group("meta"), line_no)
-
-        try:
-            connection = Connection(
-                zone_a=zone_a,
-                zone_b=zone_b,
-                max_link_capacity=int(meta.get("max_link_capacity", "1")),
-            )
-            drone_map.add_connection(connection)
-        except Exception as e:
-            raise ParserError(line_no, f"{e}: {line!r}")
-
-    def parse_lines(self, lines: list[str]) -> DroneMap:
-        drone_map: DroneMap | None = None
-        line_no = 0
-
-        for line_no, raw_line in enumerate(lines, start=1):
-            line = raw_line.split('#', 1)[0]
-            line = line.strip()
-
-            if not line:
-                continue
-
-            if line.startswith("nb_drones"):
-                nb_drones = self._parse_nb_drones(line, line_no)
-                drone_map = DroneMap(nb_drones)
-                continue
-
-            if drone_map is None:
+        for name in (zone_a, zone_b):
+            if name not in drone_map.zones:
                 raise ParserError(
-                    line_no, f"Nb_drones bust be the first line : {line_no!r}")
-
-            if line.startswith("connection"):
-                self._parse_connection(line, line_no, drone_map)
-            else:
-                self._parse_hub(line, line_no, drone_map)
-
-        if drone_map is None:
+                    line_no, f"connection refers to undefined zone {name!r} "
+                    "(zones must be declared before the connections "
+                    "using them)")
+        if zone_a == zone_b:
             raise ParserError(
-                line_no, "No nb_drones declaration found in file")
+                line_no, f"a zone cannot be connected to itself: {zone_a!r}")
+        meta = self._parse_meta(
+            match.group("meta"), _CONNECTION_META_KEYS, line_no)
 
-        if drone_map.start_zone is None or drone_map.end_zone is None:
+        capacity = 1
+        if "max_link_capacity" in meta:
+            capacity = self._positive_int(
+                meta["max_link_capacity"], "max_link_capacity", line_no)
+        try:
+            drone_map.add_connection(Connection(zone_a, zone_b, capacity))
+        except ValueError as e:
+            raise ParserError(line_no, str(e))
+
+    def _parse_meta(
+        self, meta_str: str | None, allowed: frozenset[str], line_no: int
+    ) -> dict[str, str]:
+        """Parse the ``key=value`` tokens of a metadata block.
+
+        Args:
+            meta_str: Text found between the brackets, or None.
+            allowed: Keys accepted for this kind of line.
+            line_no: Line number, used in error messages.
+
+        Returns:
+            The metadata as a dictionary.
+
+        Raises:
+            ParserError: On a malformed token or an unknown or
+                duplicated key.
+        """
+        meta: dict[str, str] = {}
+        if meta_str is None:
+            return meta
+        for token in meta_str.split():
+            key, sep, value = token.partition("=")
+            if not sep or not key or not value or "=" in value:
+                raise ParserError(
+                    line_no, f"invalid metadata token {token!r} "
+                    "(expected key=value)")
+            if key not in allowed:
+                raise ParserError(
+                    line_no, f"unknown metadata key {key!r} (allowed: "
+                    + ", ".join(sorted(allowed)) + ")")
+            if key in meta:
+                raise ParserError(
+                    line_no, f"metadata key {key!r} given twice")
+            meta[key] = value
+        return meta
+
+    def _positive_int(self, value: str, what: str, line_no: int) -> int:
+        """Convert a string to a strictly positive integer."""
+        if not (value.isascii() and value.isdigit()) or int(value) <= 0:
             raise ParserError(
-                line_no, f"End and start zone is required: {line_no!r}")
-
-        return drone_map
-
-    def parse_file(self, path: str) -> DroneMap:
-        with open(path, encoding="utf-8") as f:
-            lines = f.readlines()
-        return self.parse_lines(lines)
+                line_no, f"{what} must be a positive integer, got {value!r}")
+        return int(value)

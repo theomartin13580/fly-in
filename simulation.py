@@ -1,6 +1,9 @@
+"""Turn-by-turn scheduling of the drones on a map."""
+
 from models import Connection, DroneMap, ZoneType
 
 State = tuple[str, int]
+Link = tuple[Connection, str, ZoneType]
 
 
 class Step:
@@ -65,7 +68,7 @@ class ReservationTable:
     def zone_free(self, zone_name: str, turn: int) -> bool:
         """Tell if one more drone can be in the zone at the end of turn."""
         zone = self.drone_map.zones[zone_name]
-        if zone.is_start or zone.is_end:
+        if zone.unlimited:
             return True
         used = self.zone_usage.get((zone_name, turn), 0)
         return used < zone.max_drones
@@ -107,17 +110,19 @@ class PathFinder:
         self.start = drone_map.start_zone
         self.end = drone_map.end_zone
 
-        self.links: dict[str, list[Connection]] = {}
+        # for each zone: (connection, target name, target type), with
+        # priority zones first so that they win on a tie
+        self.links: dict[str, list[Link]] = {}
         for name in drone_map.zones:
-            priority_links: list[Connection] = []
-            other_links: list[Connection] = []
+            priority_links: list[Link] = []
+            other_links: list[Link] = []
             for connection in drone_map.neighbors(name):
                 target = drone_map.zones[connection.other(name)]
-                if target.zone_type == ZoneType.PRIORITY:
-                    priority_links.append(connection)
+                link = (connection, target.name, target.zone_type)
+                if target.zone_type is ZoneType.PRIORITY:
+                    priority_links.append(link)
                 else:
-                    other_links.append(connection)
-            # priority zones are tried first, so they win on a tie
+                    other_links.append(link)
             self.links[name] = priority_links + other_links
 
     def find_path(self, reservations: ReservationTable) -> list[Step]:
@@ -162,14 +167,12 @@ class PathFinder:
         if reservations.zone_free(zone_name, turn + 1):
             moves.append(((zone_name, turn + 1), []))
 
-        for connection in self.links[zone_name]:
-            target = connection.other(zone_name)
-            zone_type = self.drone_map.zones[target].zone_type
-            if zone_type == ZoneType.BLOCKED:
+        for connection, target, zone_type in self.links[zone_name]:
+            if zone_type is ZoneType.BLOCKED:
                 continue
-            if zone_type == ZoneType.RESTRICTED:
+            if zone_type is ZoneType.RESTRICTED:
                 # on the connection during turn + 1, in the zone at turn + 2
-                arrival = turn + 2
+                arrival = turn + zone_type.move_cost
                 if (reservations.link_free(connection, turn + 1)
                         and reservations.link_free(connection, arrival)
                         and reservations.zone_free(target, arrival)):
@@ -230,15 +233,3 @@ class Simulation:
                         moves.append(f"{drone.drone_id}-{step.label()}")
             log.append(" ".join(moves))
         return log
-
-
-if __name__ == "__main__":
-    from parser import Parser
-    from renderer import Renderer
-
-    dm = Parser().parse_file("03_ultimate_challenge.txt")
-    sim = Simulation(dm)
-    log = sim.run()
-
-    renderer = Renderer()
-    renderer.render(log, dm)
