@@ -1,0 +1,11 @@
+
+.venv/
+
+__pycache__/
+*.pyc
+
+.mypy_cache/
+.flake8_cache/
+
+.vscode/
+*.swp
