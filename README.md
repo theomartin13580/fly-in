@@ -170,6 +170,3 @@ AI (Claude) was used to:
 - generate test cases for invalid map files and an independent checker
   that replays the output log against the rules;
 - help write the docstrings and this README.
-
-The algorithm design, the pathfinding and the simulation engine were
-written and are understood by the author.
